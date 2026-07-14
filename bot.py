@@ -2,7 +2,7 @@ import asyncio
 import html
 import io
 import logging
-
+from database.db import try_consume_task, init_limits
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ParseMode
@@ -233,6 +233,14 @@ async def solve_image_task(message: Message, state: FSMContext, bot: Bot) -> Non
     image_bytes, mime_type = downloaded
     data = await state.get_data()
 
+    allowed, left = try_consume_task(message.from_user.id)
+    if not allowed:
+        await message.answer(
+        "На сегодня лимит исчерпан (10 задач в день).\n"
+        "Счётчик обнулится завтра — приходи ещё 🙂"
+    )
+    return
+    
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     waiting = await message.answer("Изучаю фотографию и готовлю подробное решение…")
 
@@ -277,6 +285,8 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     init_db()
+    init_limits()
+
 
     session = AiohttpSession(proxy=config.proxy_url) if config.proxy_url else None
     if config.proxy_url:
