@@ -1,69 +1,35 @@
-import sqlite3
 import os
+import sqlite3
+from contextlib import closing
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from datetime import date, datetime
-from pathlib import Path
 
 DB_PATH = os.getenv("DB_PATH", "database/users.db")
-DAILY_LIMIT = 10
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
+TIMEZONE = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
+
+# Результаты списания задачи
+OK = "ok"
+LIMIT_REACHED = "limit"
+NOT_REGISTERED = "not_registered"
 
 
-def _connect():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _connect() -> sqlite3.Connection:
+    directory = os.path.dirname(DB_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-def init_limits() -> None:
-    """Добавляет колонки счётчика, если их нет. Безопасно вызывать при каждом старте."""
-    conn = _connect()
-    try:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-        if "tasks_today" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN tasks_today INTEGER NOT NULL DEFAULT 0")
-        if "last_task_date" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN last_task_date TEXT")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def try_consume_task(user_id: int, limit: int = DAILY_LIMIT) -> tuple[bool, int]:
-    """
-    Пытается списать одну задачу.
-    Возвращает (можно_ли, сколько_осталось_после_списания).
-    Счётчик сам обнуляется при смене дня — cron не нужен.
-    """
-    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
-    conn = _connect()
-    try:
-        row = conn.execute(
-            "SELECT tasks_today, last_task_date FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-
-        if row is None:
-            return False, 0                      # не зарегистрирован
-
-        # новый день -> счётчик с нуля
-        used = row["tasks_today"] if row["last_task_date"] == today else 0
-
-        if used >= limit:
-            return False, 0
-
-        conn.execute(
-            "UPDATE users SET tasks_today = ?, last_task_date = ? WHERE user_id = ?",
-            (used + 1, today, user_id),
-        )
-        conn.commit()
-        return True, limit - (used + 1)
-    finally:
-        conn.close()
+def _today() -> str:
+    """Сегодняшняя дата строкой YYYY-MM-DD — так же, как она лежит в базе."""
+    return datetime.now(TIMEZONE).date().isoformat()
 
 
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(_connect()) as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -80,13 +46,72 @@ def init_db() -> None:
         connection.commit()
 
 
+def init_limits() -> None:
+    """Добавляет колонки счётчика, если их нет. Безопасно вызывать при каждом старте."""
+    with closing(_connect()) as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+        if "tasks_today" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN tasks_today INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_task_date" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN last_task_date TEXT")
+        connection.commit()
+
+
+def try_consume_task(telegram_id: int, limit: int = DAILY_LIMIT) -> tuple[str, int]:
+    """
+    Пытается списать одну задачу.
+    Возвращает (статус, сколько_осталось_после_списания).
+    Статус: OK / LIMIT_REACHED / NOT_REGISTERED.
+    Счётчик обнуляется сам при смене дня — cron не нужен.
+    """
+    today = _today()
+    with closing(_connect()) as connection:
+        row = connection.execute(
+            "SELECT tasks_today, last_task_date FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+
+        if row is None:
+            return NOT_REGISTERED, 0
+
+        # Новый день -> счётчик с нуля
+        used = row["tasks_today"] if row["last_task_date"] == today else 0
+
+        if used >= limit:
+            return LIMIT_REACHED, 0
+
+        connection.execute(
+            "UPDATE users SET tasks_today = ?, last_task_date = ? WHERE telegram_id = ?",
+            (used + 1, today, telegram_id),
+        )
+        connection.commit()
+        return OK, limit - (used + 1)
+
+
+def refund_task(telegram_id: int) -> None:
+    """Возвращает списанную задачу, если запрос к ИИ не удался."""
+    today = _today()
+    with closing(_connect()) as connection:
+        connection.execute(
+            """
+            UPDATE users
+            SET tasks_today = MAX(tasks_today - 1, 0)
+            WHERE telegram_id = ? AND last_task_date = ?
+            """,
+            (telegram_id, today),
+        )
+        connection.commit()
+
+
 def save_user(
     telegram_id: int,
     username: str | None,
     display_name: str,
     school_class: int,
 ) -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(_connect()) as connection:
         connection.execute(
             """
             INSERT INTO users (telegram_id, username, display_name, school_class)
@@ -103,7 +128,7 @@ def save_user(
 
 
 def update_subject(telegram_id: int, subject: str) -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(_connect()) as connection:
         connection.execute(
             """
             UPDATE users

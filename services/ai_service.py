@@ -1,18 +1,33 @@
+import logging
 import re
 
 from google import genai
 from google.genai import types
 
+logger = logging.getLogger(__name__)
+
 
 class StudyAI:
-    def __init__(self, api_key: str, model: str, proxy_url: str | None = None) -> None:
-        http_options = None
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        proxy_url: str | None = None,
+        timeout_seconds: int = 120,
+    ) -> None:
+        # ВАЖНО: google-genai по умолчанию ставит timeout=None,
+        # то есть висит вечно. Явный таймаут обязателен.
+        # HttpOptions.timeout задаётся в МИЛЛИСЕКУНДАХ.
+        options: dict = {"timeout": timeout_seconds * 1000}
+
         if proxy_url:
-            http_options = types.HttpOptions(
-                client_args={"proxy": proxy_url},
-                async_client_args={"proxy": proxy_url},
-            )
-        self.client = genai.Client(api_key=api_key, http_options=http_options)
+            options["client_args"] = {"proxy": proxy_url}
+            options["async_client_args"] = {"proxy": proxy_url}
+
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(**options),
+        )
         self.model = model
 
     @staticmethod
@@ -193,32 +208,16 @@ a / b
             text = text.replace(old, new)
 
         # Векторы: \vec{a} -> вектор a
-        text = re.sub(
-            r"\\vec\{([^{}]+)\}",
-            r"вектор \1",
-            text,
-        )
+        text = re.sub(r"\\vec\{([^{}]+)\}", r"вектор \1", text)
+
+        # Степень корня: \sqrt[3]{8} -> ³√(8)  (до обычного \sqrt!)
+        text = re.sub(r"\\sqrt\[3\]\{([^{}]+)\}", r"³√(\1)", text)
 
         # Корни: \sqrt{100} -> √(100)
-        text = re.sub(
-            r"\\sqrt\{([^{}]+)\}",
-            r"√(\1)",
-            text,
-        )
-
-        # Степень корня: \sqrt[3]{8} -> ³√(8)
-        text = re.sub(
-            r"\\sqrt\[3\]\{([^{}]+)\}",
-            r"³√(\1)",
-            text,
-        )
+        text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
 
         # Дроби: \frac{a}{b} -> (a) / (b)
-        text = re.sub(
-            r"\\frac\{([^{}]+)\}\{([^{}]+)\}",
-            r"(\1) / (\2)",
-            text,
-        )
+        text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1) / (\2)", text)
 
         # Степени
         superscripts = {
@@ -243,40 +242,27 @@ a / b
         )
 
         # Убираем оставшиеся простые LaTeX-команды
-        text = re.sub(
-            r"\\[a-zA-Z]+",
-            "",
-            text,
-        )
+        text = re.sub(r"\\[a-zA-Z]+", "", text)
 
         # Убираем лишние фигурные скобки
         text = text.replace("{", "")
         text = text.replace("}", "")
 
         # Не больше двух пустых строк подряд
-        text = re.sub(
-            r"\n{3,}",
-            "\n\n",
-            text,
-        )
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
-        return text.strip()
+        cleaned = text.strip()
+        return cleaned or "Не удалось получить текст ответа."
 
-    def _generate(
-        self,
-        contents,
-        subject: str,
-    ) -> str:
+    def _generate(self, contents, subject: str) -> str:
         config = types.GenerateContentConfig()
 
         if self._is_exact_subject(subject):
             config = types.GenerateContentConfig(
-                tools=[
-                    types.Tool(
-                        code_execution=types.ToolCodeExecution
-                    )
-                ]
+                tools=[types.Tool(code_execution=types.ToolCodeExecution())]
             )
+
+        logger.info("Gemini: запрос к модели %s (предмет: %s)", self.model, subject)
 
         response = self.client.models.generate_content(
             model=self.model,
@@ -286,24 +272,19 @@ a / b
 
         answer = response.text or ""
 
+        if not answer:
+            # Пустой text бывает, когда модель вернула только код/мысли
+            # либо ответ обрезан фильтром безопасности.
+            feedback = getattr(response, "prompt_feedback", None)
+            logger.warning("Gemini вернул пустой text. prompt_feedback=%s", feedback)
+
+        logger.info("Gemini: получен ответ, %d символов", len(answer))
+
         return self._clean_ai_text(answer)
 
-    def solve_text(
-        self,
-        school_class: int,
-        subject: str,
-        task: str,
-    ) -> str:
-        prompt = self._prompt(
-            school_class=school_class,
-            subject=subject,
-            task=task,
-        )
-
-        return self._generate(
-            contents=prompt,
-            subject=subject,
-        )
+    def solve_text(self, school_class: int, subject: str, task: str) -> str:
+        prompt = self._prompt(school_class=school_class, subject=subject, task=task)
+        return self._generate(contents=prompt, subject=subject)
 
     def solve_image(
         self,
@@ -312,20 +293,6 @@ a / b
         image_bytes: bytes,
         mime_type: str,
     ) -> str:
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type=mime_type,
-        )
-
-        prompt = self._prompt(
-            school_class=school_class,
-            subject=subject,
-        )
-
-        return self._generate(
-            contents=[
-                image_part,
-                prompt,
-            ],
-            subject=subject,
-        )
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        prompt = self._prompt(school_class=school_class, subject=subject)
+        return self._generate(contents=[image_part, prompt], subject=subject)

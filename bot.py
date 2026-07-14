@@ -2,7 +2,7 @@ import asyncio
 import html
 import io
 import logging
-from database.db import try_consume_task, init_limits
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ParseMode
@@ -12,6 +12,15 @@ from aiogram.types import Message, ReplyKeyboardRemove
 
 from config import load_config
 from database import init_db, save_user, update_subject
+from database.db import (
+    DAILY_LIMIT,
+    LIMIT_REACHED,
+    NOT_REGISTERED,
+    OK,
+    init_limits,
+    refund_task,
+    try_consume_task,
+)
 from keyboards import (
     CLASSES,
     SUBJECTS,
@@ -25,12 +34,26 @@ from states import StudyForm
 
 router = Router()
 config = load_config()
-study_ai = StudyAI(config.gemini_api_key, config.gemini_model)
+
+# Жёсткий потолок ожидания ответа ИИ. Должен быть чуть больше,
+# чем таймаут внутри StudyAI, чтобы сработал сначала он.
+AI_TIMEOUT_SECONDS = 120
+
+study_ai = StudyAI(
+    config.gemini_api_key,
+    config.gemini_model,
+    proxy_url=config.proxy_url,
+    timeout_seconds=AI_TIMEOUT_SECONDS - 10,
+)
 MAX_TELEGRAM_MESSAGE = 4000
 
 
 async def send_long_message(message: Message, text: str) -> None:
     text = text.strip()
+    if not text:
+        await message.answer("Ответ получился пустым. Попробуй переформулировать задание.")
+        return
+
     while text:
         if len(text) <= MAX_TELEGRAM_MESSAGE:
             await message.answer(text)
@@ -40,8 +63,34 @@ async def send_long_message(message: Message, text: str) -> None:
         if split_at < 1000:
             split_at = MAX_TELEGRAM_MESSAGE
 
-        await message.answer(text[:split_at].strip())
+        chunk = text[:split_at].strip()
+        if chunk:
+            await message.answer(chunk)
         text = text[split_at:].strip()
+
+
+async def check_limit(message: Message) -> bool:
+    """Списывает одну задачу. Возвращает True, если можно продолжать."""
+    try:
+        status, left = try_consume_task(message.from_user.id)
+    except Exception as error:
+        logging.exception("Не удалось проверить лимит: %s", error)
+        # Лучше пропустить пользователя, чем сломать бота из-за счётчика
+        return True
+
+    if status == NOT_REGISTERED:
+        await message.answer("Ты ещё не зарегистрирован. Нажми /start, чтобы начать.")
+        return False
+
+    if status == LIMIT_REACHED:
+        await message.answer(
+            f"На сегодня лимит исчерпан ({DAILY_LIMIT} задач в день).\n"
+            "Счётчик обнулится завтра — приходи ещё 🙂"
+        )
+        return False
+
+    logging.info("Пользователь %s: осталось задач сегодня %s", message.from_user.id, left)
+    return True
 
 
 async def start_registration(message: Message, state: FSMContext) -> None:
@@ -177,15 +226,25 @@ async def solve_text_task(message: Message, state: FSMContext, bot: Bot) -> None
         return
 
     data = await state.get_data()
+    if not data.get("school_class") or not data.get("subject"):
+        await message.answer("Что-то сбилось. Нажми /start и выбери класс и предмет заново.")
+        return
+
+    if not await check_limit(message):
+        return
+
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     waiting = await message.answer("Разбираю задачу и готовлю подробное решение…")
 
     try:
-        answer = await asyncio.to_thread(
-            study_ai.solve_text,
-            data["school_class"],
-            data["subject"],
-            task,
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(
+                study_ai.solve_text,
+                data["school_class"],
+                data["subject"],
+                task,
+            ),
+            timeout=AI_TIMEOUT_SECONDS,
         )
         await waiting.delete()
         await send_long_message(message, answer)
@@ -193,10 +252,18 @@ async def solve_text_task(message: Message, state: FSMContext, bot: Bot) -> None
             "Готово. Что делаем дальше?",
             reply_markup=after_answer_keyboard(),
         )
+    except asyncio.TimeoutError:
+        logging.error("Gemini text request timed out after %ss", AI_TIMEOUT_SECONDS)
+        refund_task(message.from_user.id)
+        await waiting.edit_text(
+            "Gemini не ответил за отведённое время. Попробуй ещё раз или упрости задание."
+        )
     except Exception as error:
         logging.exception("Gemini text request failed: %s", error)
+        refund_task(message.from_user.id)
         await waiting.edit_text(
-            "Не удалось получить ответ от Gemini. Проверь API-ключ, название модели и интернет."
+            f"Не удалось получить ответ от Gemini.\n\nТехническая причина: "
+            f"{type(error).__name__}: {str(error)[:300]}"
         )
 
 
@@ -232,26 +299,26 @@ async def solve_image_task(message: Message, state: FSMContext, bot: Bot) -> Non
 
     image_bytes, mime_type = downloaded
     data = await state.get_data()
+    if not data.get("school_class") or not data.get("subject"):
+        await message.answer("Что-то сбилось. Нажми /start и выбери класс и предмет заново.")
+        return
 
-    allowed, left = try_consume_task(message.from_user.id)
-    if not allowed:
-        await message.answer(
-        "На сегодня лимит исчерпан (10 задач в день).\n"
-        "Счётчик обнулится завтра — приходи ещё 🙂"
-    )
-    return
-    
-    
+    if not await check_limit(message):
+        return
+
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     waiting = await message.answer("Изучаю фотографию и готовлю подробное решение…")
 
     try:
-        answer = await asyncio.to_thread(
-            study_ai.solve_image,
-            data["school_class"],
-            data["subject"],
-            image_bytes,
-            mime_type,
+        answer = await asyncio.wait_for(
+            asyncio.to_thread(
+                study_ai.solve_image,
+                data["school_class"],
+                data["subject"],
+                image_bytes,
+                mime_type,
+            ),
+            timeout=AI_TIMEOUT_SECONDS,
         )
         await waiting.delete()
         await send_long_message(message, answer)
@@ -259,10 +326,18 @@ async def solve_image_task(message: Message, state: FSMContext, bot: Bot) -> Non
             "Готово. Что делаем дальше?",
             reply_markup=after_answer_keyboard(),
         )
+    except asyncio.TimeoutError:
+        logging.error("Gemini image request timed out after %ss", AI_TIMEOUT_SECONDS)
+        refund_task(message.from_user.id)
+        await waiting.edit_text(
+            "Gemini не ответил за отведённое время. Попробуй ещё раз или пришли фото поменьше."
+        )
     except Exception as error:
         logging.exception("Gemini image request failed: %s", error)
+        refund_task(message.from_user.id)
         await waiting.edit_text(
-            "Не удалось обработать фотографию. Попробуй отправить более чёткое фото или проверь настройки Gemini."
+            f"Не удалось обработать фотографию.\n\nТехническая причина: "
+            f"{type(error).__name__}: {str(error)[:300]}"
         )
 
 
@@ -288,16 +363,16 @@ async def main() -> None:
     init_db()
     init_limits()
 
-
     session = AiohttpSession(proxy=config.proxy_url) if config.proxy_url else None
     if config.proxy_url:
-        logging.info("Telegram: используется прокси %s", config.proxy_url)
+        logging.info("Telegram и Gemini: используется прокси %s", config.proxy_url)
 
     bot = Bot(token=config.bot_token, session=session)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Бот запущен. Модель: %s", config.gemini_model)
     await dispatcher.start_polling(bot)
 
 
