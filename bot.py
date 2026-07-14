@@ -240,7 +240,7 @@ async def solve_image_task(message: Message, state: FSMContext, bot: Bot) -> Non
         "Счётчик обнулится завтра — приходи ещё 🙂"
     )
     return
-    await message.answer(f"Осталось задач сегодня: {left}")
+    
     
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     waiting = await message.answer("Изучаю фотографию и готовлю подробное решение…")
