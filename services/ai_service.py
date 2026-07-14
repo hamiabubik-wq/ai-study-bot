@@ -5,8 +5,14 @@ from google.genai import types
 
 
 class StudyAI:
-    def __init__(self, api_key: str, model: str) -> None:
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str, model: str, proxy_url: str | None = None) -> None:
+        http_options = None
+        if proxy_url:
+            http_options = types.HttpOptions(
+                client_args={"proxy": proxy_url},
+                async_client_args={"proxy": proxy_url},
+            )
+        self.client = genai.Client(api_key=api_key, http_options=http_options)
         self.model = model
 
     @staticmethod

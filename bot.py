@@ -25,8 +25,7 @@ from states import StudyForm
 
 router = Router()
 config = load_config()
-study_ai = StudyAI(config.gemini_api_key, config.gemini_model, config.proxy_url)
-
+study_ai = StudyAI(config.gemini_api_key, config.gemini_model)
 MAX_TELEGRAM_MESSAGE = 4000
 
 
