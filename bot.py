@@ -9,6 +9,7 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, ReplyKeyboardRemove
+from google.genai.errors import ServerError
 
 from config import load_config
 from database import init_db, save_user, update_subject
@@ -35,15 +36,17 @@ from states import StudyForm
 router = Router()
 config = load_config()
 
-# Жёсткий потолок ожидания ответа ИИ. Должен быть чуть больше,
-# чем таймаут внутри StudyAI, чтобы сработал сначала он.
-AI_TIMEOUT_SECONDS = 120
+# Потолок на ОДИН http-запрос к Gemini.
+GEMINI_REQUEST_TIMEOUT = 60
+# Потолок на всю операцию: 4 попытки к основной модели + запасная модель.
+AI_TIMEOUT_SECONDS = 180
 
 study_ai = StudyAI(
     config.gemini_api_key,
     config.gemini_model,
+    fallback_model=config.gemini_fallback_model,
     proxy_url=config.proxy_url,
-    timeout_seconds=AI_TIMEOUT_SECONDS - 10,
+    timeout_seconds=GEMINI_REQUEST_TIMEOUT,
 )
 MAX_TELEGRAM_MESSAGE = 4000
 
@@ -258,6 +261,13 @@ async def solve_text_task(message: Message, state: FSMContext, bot: Bot) -> None
         await waiting.edit_text(
             "Gemini не ответил за отведённое время. Попробуй ещё раз или упрости задание."
         )
+    except ServerError as error:
+        logging.error("Gemini недоступен: %s", error)
+        refund_task(message.from_user.id)
+        await waiting.edit_text(
+            "Серверы Gemini сейчас перегружены и не отвечают. "
+            "Это временно — подожди пару минут и пришли задачу ещё раз."
+        )
     except Exception as error:
         logging.exception("Gemini text request failed: %s", error)
         refund_task(message.from_user.id)
@@ -332,6 +342,13 @@ async def solve_image_task(message: Message, state: FSMContext, bot: Bot) -> Non
         await waiting.edit_text(
             "Gemini не ответил за отведённое время. Попробуй ещё раз или пришли фото поменьше."
         )
+    except ServerError as error:
+        logging.error("Gemini недоступен: %s", error)
+        refund_task(message.from_user.id)
+        await waiting.edit_text(
+            "Серверы Gemini сейчас перегружены и не отвечают. "
+            "Это временно — подожди пару минут и пришли фото ещё раз."
+        )
     except Exception as error:
         logging.exception("Gemini image request failed: %s", error)
         refund_task(message.from_user.id)
@@ -372,7 +389,11 @@ async def main() -> None:
     dispatcher.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот запущен. Модель: %s", config.gemini_model)
+    logging.info(
+        "Бот запущен. Модель: %s, запасная: %s",
+        config.gemini_model,
+        config.gemini_fallback_model or "нет",
+    )
     await dispatcher.start_polling(bot)
 
 

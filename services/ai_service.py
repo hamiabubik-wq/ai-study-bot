@@ -2,7 +2,7 @@ import logging
 import re
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 logger = logging.getLogger(__name__)
 
@@ -12,13 +12,25 @@ class StudyAI:
         self,
         api_key: str,
         model: str,
+        fallback_model: str | None = None,
         proxy_url: str | None = None,
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 60,
     ) -> None:
-        # ВАЖНО: google-genai по умолчанию ставит timeout=None,
-        # то есть висит вечно. Явный таймаут обязателен.
-        # HttpOptions.timeout задаётся в МИЛЛИСЕКУНДАХ.
-        options: dict = {"timeout": timeout_seconds * 1000}
+        # 1) google-genai по умолчанию ставит timeout=None -> висит вечно.
+        #    HttpOptions.timeout задаётся в МИЛЛИСЕКУНДАХ.
+        # 2) Повторы по умолчанию ВЫКЛЮЧЕНЫ (retry_args(None) = "never retry").
+        #    Включаем явно: 4 попытки с паузами ~1, 2, 4 сек.
+        #    Ретраятся коды 408, 429, 500, 502, 503, 504 — то есть ровно
+        #    наш 503 UNAVAILABLE ("модель перегружена").
+        options: dict = {
+            "timeout": timeout_seconds * 1000,
+            "retry_options": types.HttpRetryOptions(
+                attempts=4,
+                initial_delay=1.0,
+                max_delay=15.0,
+                exp_base=2,
+            ),
+        }
 
         if proxy_url:
             options["client_args"] = {"proxy": proxy_url}
@@ -29,6 +41,7 @@ class StudyAI:
             http_options=types.HttpOptions(**options),
         )
         self.model = model
+        self.fallback_model = fallback_model
 
     @staticmethod
     def _is_exact_subject(subject: str) -> bool:
@@ -254,31 +267,43 @@ a / b
         cleaned = text.strip()
         return cleaned or "Не удалось получить текст ответа."
 
-    def _generate(self, contents, subject: str) -> str:
-        config = types.GenerateContentConfig()
-
+    def _build_config(self, subject: str) -> types.GenerateContentConfig:
         if self._is_exact_subject(subject):
-            config = types.GenerateContentConfig(
+            return types.GenerateContentConfig(
                 tools=[types.Tool(code_execution=types.ToolCodeExecution())]
             )
+        return types.GenerateContentConfig()
 
-        logger.info("Gemini: запрос к модели %s (предмет: %s)", self.model, subject)
-
+    def _call(self, model: str, contents, config) -> str:
+        logger.info("Gemini: запрос к модели %s", model)
         response = self.client.models.generate_content(
-            model=self.model,
+            model=model,
             contents=contents,
             config=config,
         )
-
         answer = response.text or ""
-
         if not answer:
-            # Пустой text бывает, когда модель вернула только код/мысли
-            # либо ответ обрезан фильтром безопасности.
             feedback = getattr(response, "prompt_feedback", None)
             logger.warning("Gemini вернул пустой text. prompt_feedback=%s", feedback)
+        logger.info("Gemini: ответ от %s, %d символов", model, len(answer))
+        return answer
 
-        logger.info("Gemini: получен ответ, %d символов", len(answer))
+    def _generate(self, contents, subject: str) -> str:
+        config = self._build_config(subject)
+
+        try:
+            answer = self._call(self.model, contents, config)
+        except errors.ServerError as error:
+            # Все повторы к основной модели уже исчерпаны (503/500/502/504).
+            if not self.fallback_model:
+                raise
+            logger.warning(
+                "Модель %s недоступна (%s). Пробую запасную: %s",
+                self.model,
+                getattr(error, "code", "?"),
+                self.fallback_model,
+            )
+            answer = self._call(self.fallback_model, contents, config)
 
         return self._clean_ai_text(answer)
 
