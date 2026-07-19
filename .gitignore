@@ -1,8 +1,5 @@
 .env
 venv/
-.venv/
 __pycache__/
 *.pyc
-database/users.db
-.idea/
-.vscode/
+bot.db
